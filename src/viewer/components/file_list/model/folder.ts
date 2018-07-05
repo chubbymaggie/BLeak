@@ -1,4 +1,4 @@
-import {SourceFile} from '../../../model/source_file_manager';
+import SourceFile from '../../../model/source_file';
 
 export const enum FolderType {
   ORIGIN,
@@ -65,10 +65,19 @@ export default class Folder {
   }
 
   /**
-   * Returns true if this folder contains the given URL.
-   * @param url
+   * Returns true if this folder contains the given file.
+   * @param file
    */
-  public hasFile(url: string): boolean {
-    return url.startsWith(this._fullPath);
+  public hasFile(file: SourceFile): boolean {
+    const hasFile = this.files.indexOf(file) !== -1;
+    if (hasFile) {
+      return hasFile;
+    }
+    for (const folder of this.folders) {
+      if (folder.hasFile(file)) {
+        return true;
+      }
+    }
+    return false;
   }
 }

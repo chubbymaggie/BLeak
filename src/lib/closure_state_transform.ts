@@ -1,9 +1,10 @@
 import {Node, BaseStatement, Statement, Program, EmptyStatement, BlockStatement, ExpressionStatement, IfStatement, LabeledStatement, BreakStatement, ContinueStatement, WithStatement, SwitchStatement, ReturnStatement, ThrowStatement, TryStatement, WhileStatement, DoWhileStatement, ForStatement, ForInStatement, DebuggerStatement, ForOfStatement, FunctionDeclaration, VariableDeclaration, VariableDeclarator, ThisExpression, ArrayExpression, ObjectExpression, Property, FunctionExpression, SequenceExpression, UnaryExpression, BinaryExpression, AssignmentExpression, UpdateExpression, LogicalExpression, ConditionalExpression, NewExpression, CallExpression, MemberExpression, SwitchCase, CatchClause, Identifier, Literal, Super, SpreadElement, ArrowFunctionExpression, YieldExpression, TemplateElement, TemplateLiteral, TaggedTemplateExpression, ObjectPattern, ArrayPattern, RestElement, AssignmentPattern, ClassBody, ClassDeclaration, ClassExpression, MethodDefinition, MetaProperty, ImportDeclaration, ImportDefaultSpecifier, ImportNamespaceSpecifier, ImportSpecifier, ExportAllDeclaration, ExportDefaultDeclaration, ExportNamedDeclaration, ExportSpecifier, AwaitExpression} from 'estree';
-import {parse as parseJavaScript} from 'esprima';
+import {parseScript as parseJavaScript} from 'esprima';
 import {generate as generateJavaScript} from 'astring';
 import {SourceMapGenerator, SourceMapConsumer, RawSourceMap} from 'source-map';
 import {transform as buble} from 'buble';
 import {transform as babel} from 'babel-core';
+import {dirname} from 'path';
 
 /**
  * Fake AST node that contains multiple statements that must be
@@ -35,7 +36,7 @@ function getPolyfillInsertion(url: string): IfStatement {
     test: {
       type: "BinaryExpression",
       operator: "===",
-      left: {
+      left: ({
         type: "UnaryExpression",
         operator: "typeof",
         argument: {
@@ -43,7 +44,7 @@ function getPolyfillInsertion(url: string): IfStatement {
           name: "regeneratorRuntime"
         },
         prefix: true
-      },
+      } as UnaryExpression),
       right: {
         type: "Literal",
         value: "undefined",
@@ -78,7 +79,7 @@ function getAgentInsertion(url: string): IfStatement {
     test: {
       type: "BinaryExpression",
       operator: "===",
-      left: {
+      left: ({
         type: "UnaryExpression",
         operator: "typeof",
         argument: {
@@ -86,7 +87,7 @@ function getAgentInsertion(url: string): IfStatement {
           name: "$$$CREATE_SCOPE_OBJECT$$$"
         },
         prefix: true
-      },
+      } as UnaryExpression),
       right: {
         type: "Literal",
         value: "undefined",
@@ -325,7 +326,6 @@ function getProgramPrelude(statements: IfStatement[]): ExpressionStatement {
           }]).concat(statements)
         },
         generator: false,
-        expression: false,
         async: false
       },
       arguments: []
@@ -371,7 +371,7 @@ function getScopeAssignment(functionVarName: string, scopeVarName: string): Expr
         computed: false,
         object: {
           type: "Identifier",
-          name: "Object"
+          name: "$$$OBJECT$$$"
         },
         property: {
           type: "Identifier",
@@ -600,14 +600,50 @@ interface IScope {
 
 class GlobalScope implements IScope {
   public scopeIdentifier: string;
-  constructor(scopeIdentifier = "$$$GLOBAL$$$") {
+  private _defineFunctionDeclsOnScope: boolean;
+  constructor(scopeIdentifier = "$$$GLOBAL$$$", defineFunctionDeclsOnScope: boolean = false) {
     this.scopeIdentifier = scopeIdentifier;
+    this._defineFunctionDeclsOnScope = defineFunctionDeclsOnScope;
   }
 
   protected _vars = new Map<string, Variable>();
   public defineVariable(name: string, type: VarType): void {
     // Make all global variables closed over.
     this._vars.set(name, new Variable(type, true));
+  }
+  public prelude(): ExpressionStatement[] {
+    const rv: ExpressionStatement[] = [];
+    if (this._defineFunctionDeclsOnScope) {
+      // scopeidentifier.foo
+      this._vars.forEach((v, name) => {
+        if (v.type === VarType.FUNCTION_DECL) {
+          rv.push({
+            "type": "ExpressionStatement",
+            "expression": {
+              "type": "AssignmentExpression",
+              "operator": "=",
+              "left": {
+                "type": "MemberExpression",
+                "computed": false,
+                "object": {
+                  "type": "Identifier",
+                  "name": this.scopeIdentifier
+                },
+                "property": {
+                  "type": "Identifier",
+                  "name": name
+                }
+              },
+              "right": {
+                "type": "Identifier",
+                "name": name
+              }
+            }
+          });
+        }
+      });
+    }
+    return rv;
   }
   public maybeCloseOverVariable(name: string): void {}
   public evalFound(): void {}
@@ -647,6 +683,10 @@ class GlobalScope implements IScope {
  */
 class ProxyScope extends GlobalScope {
   public shouldMoveTo(name: string): string {
+    // "arguments" is a special-case.
+    if (name === "arguments" && !this._vars.has(name)) {
+      return null;
+    }
     return this.scopeIdentifier;
   }
 }
@@ -697,9 +737,14 @@ class BlockScope implements IScope  {
   }
 
   public defineVariable(name: string, type: VarType): void {
-    if (type === VarType.VAR && !this.isFunctionScope) {
-      // VAR types must be defined in the top-most scope of a function.
-      return this.parent.defineVariable(name, type);
+    if (type === VarType.VAR) {
+      if (!this.isFunctionScope) {
+        // VAR types must be defined in the top-most scope of a function.
+        return this.parent.defineVariable(name, type);
+      } else if (this._vars.has(name)) {
+        // Redeclaring a variable is a no-op.
+        return;
+      }
     }
 //    if (this._vars.has(name)) {
       // Merge.
@@ -1471,7 +1516,7 @@ class ScopeScanningVisitor extends Visitor {
 
   public FunctionExpression(fe: FunctionExpression): FunctionExpression {
     if (fe.id) {
-      this._defineInNextBlock.push({type: VarType.CONST, name: fe.id.name });
+      this._defineInNextBlock.push({type: VarType.VAR, name: fe.id.name });
     }
     const args = fe.params;
     for (const arg of args) {
@@ -1774,6 +1819,9 @@ class ScopeCreationVisitor extends Visitor {
 
   protected _insertScopeCreationAndFunctionScopeAssignments(n: Node[], isProgram: boolean): Node[] {
     let mods: Node[] = this._scope instanceof BlockScope && this._scope.hasClosedOverVariables ? [this._scope.getScopeCreationStatement()] : [];
+    if (this._scope instanceof GlobalScope) {
+      mods = mods.concat(this._scope.prelude());
+    }
     if (isProgram) {
       const insertions = [getAgentInsertion(this._agentUrl)];
       if (this._polyfillUrl !== null) {
@@ -1810,6 +1858,15 @@ class ScopeCreationVisitor extends Visitor {
   }
 
   public Identifier(i: Identifier): Identifier | MemberExpression {
+    if (i.name === 'eval') {
+      // Optimistically rewrite to be an eval reference, which autoevals code in the global
+      // scope.
+      return {
+        type: "Identifier",
+        name: "$$$GLOBAL_EVAL$$$",
+        loc: i.loc
+      };
+    }
     const to = this._scope.shouldMoveTo(i.name);
     if (to) {
       return {
@@ -1848,7 +1905,10 @@ class ScopeCreationVisitor extends Visitor {
           type: "AssignmentExpression",
           operator: "=",
           left: newId,
-          right: decl.init ? decl.init : { type: "Identifier", name: "undefined", loc: decl.loc },
+          // var Foo => $$$GLOBAL$$$.Foo = ;$$$GLOBAL$$$.Foo;
+          // Prevents issues where code re-defines variable multiple times.
+          // (Subsequent redefinitions are NOPs)
+          right: (decl.init ? decl.init : newId),//{ type: "Identifier", name: "undefined", loc: decl.loc },
           loc: decl.loc
         },
         loc: decl.loc
@@ -1919,9 +1979,9 @@ class ScopeCreationVisitor extends Visitor {
     // Cannot have statements on the left of a `for in` or `for of`.
     // Unwrap into an expression.
     if ((<any> left).type === "ExpressionStatement") {
-      rv.left = (<ExpressionStatement><any> left).expression;
-      if (rv.left.type === "AssignmentExpression") {
-        rv.left = rv.left.left as MemberExpression;
+      rv.left = (<any> left).expression;
+      if ((rv.left as any).type === "AssignmentExpression") {
+        rv.left = (rv.left as any as AssignmentExpression).left as MemberExpression;
       }
     }
     return rv;
@@ -1945,8 +2005,13 @@ class ScopeCreationVisitor extends Visitor {
     const scopeId = this._scope.scopeIdentifier;
     switch (callee.type) {
       case "Identifier":
-        if (callee.name === "eval") {
+        if (callee.name === "$$$GLOBAL_EVAL$$$") {
           callee.name = "$$$REWRITE_EVAL$$$";
+          rv.arguments.unshift({
+            "type": "Literal",
+            "value": this._strictMode,
+            "raw": "true"
+          });
           rv.arguments.unshift({
             type: "Identifier",
             name: scopeId
@@ -2095,7 +2160,7 @@ class ScopeCreationVisitor extends Visitor {
   // Shortcomings: ++ to arguments.
 }
 
-function exposeClosureStateInternal(filename: string, source: string, sourceMap: SourceMapGenerator, agentUrl: string, polyfillUrl: string, evalScopeName?: string): string {
+function exposeClosureStateInternal(filename: string, source: string, sourceMap: SourceMapGenerator, agentUrl: string, polyfillUrl: string, evalScopeName?: string, strictMode?: boolean): string {
   let ast = parseJavaScript(source, { loc: true });
   {
     const firstStatement = ast.body[0];
@@ -2109,8 +2174,16 @@ function exposeClosureStateInternal(filename: string, source: string, sourceMap:
 
   const map = new Map<Program | BlockStatement, BlockScope>();
   const symbols = new Set<string>();
+  let globalScope = undefined;
+  if (evalScopeName) {
+    globalScope = new ProxyScope(evalScopeName, strictMode === false);
+    // In strict mode, newly defined variables cannot escape.
+    if (strictMode) {
+      globalScope = new BlockScope(globalScope, true);
+    }
+  }
   ast = ScopeCreationVisitor.Visit(
-    EscapeAnalysisVisitor.Visit(ScopeScanningVisitor.Visit(ast, map, symbols, evalScopeName ? new BlockScope(new ProxyScope(evalScopeName), true) : undefined), map), map, symbols, agentUrl, polyfillUrl);
+    EscapeAnalysisVisitor.Visit(ScopeScanningVisitor.Visit(ast, map, symbols, globalScope), map), map, symbols, agentUrl, polyfillUrl);
   return generateJavaScript(ast, { sourceMap });
 }
 
@@ -2161,10 +2234,13 @@ function tryJSTransform(filename: string, source: string, transform: (filename: 
         file: filename
       });
       const converted = transform(filename, transformed.code, conversionSourceMap, false);
-      return embedSourceMap(converted, mergeMaps(filename, source, transformed.map, conversionSourceMap.toJSON()));
+      return embedSourceMap(converted, mergeMaps(filename, source, transformed.map, (conversionSourceMap as any).toJSON() as RawSourceMap));
     } catch (e) {
       try {
         // Might be even crazier ES2015! Use Babel (SLOWEST PATH)
+        // Babel wants to know the exact location of this preset plugin.
+        // I really don't like Babel's (un)usability.
+        const envPath = dirname(require.resolve('babel-preset-env/package.json'));
         const transformed = babel(source, {
           sourceMapTarget: filename,
           sourceFileName: filename,
@@ -2172,13 +2248,13 @@ function tryJSTransform(filename: string, source: string, transform: (filename: 
           sourceMaps: true,
           // Disable modules to disable global "use strict"; declaration
           // https://stackoverflow.com/a/39225403
-          presets: [["es2015", { "modules": false }]]
+          presets: [[envPath, { "modules": false }]]
         });
         const conversionSourceMap = new SourceMapGenerator({
           file: filename
         });
         const converted = transform(filename, transformed.code, conversionSourceMap, true);
-        return embedSourceMap(converted, mergeMaps(filename, source, <any> transformed.map, conversionSourceMap.toJSON()));
+        return embedSourceMap(converted, mergeMaps(filename, source, <any> transformed.map, (conversionSourceMap as any).toJSON() as RawSourceMap));
       } catch (e) {
         console.error(`Unable to transform ${filename} - going to proceed with untransformed JavaScript!\nError:`);
         console.error(e);
@@ -2221,8 +2297,18 @@ export function ensureES5(filename: string, source: string, agentUrl="bleak_agen
  *
  * @param source Source of the JavaScript file.
  */
-export function exposeClosureState(filename: string, source: string, agentUrl="bleak_agent.js", polyfillUrl="bleak_polyfill.js", evalScopeName?: string): string {
+export function exposeClosureState(filename: string, source: string, agentUrl="bleak_agent.js", polyfillUrl="bleak_polyfill.js", evalScopeName?: string, strictMode?: boolean): string {
   return tryJSTransform(filename, source, (filename, source, sourceMap, needsBabel) => {
-    return exposeClosureStateInternal(filename, source, sourceMap, agentUrl, needsBabel ? polyfillUrl : null, evalScopeName)
+    return exposeClosureStateInternal(filename, source, sourceMap, agentUrl, needsBabel ? polyfillUrl : null, evalScopeName, strictMode)
   });
+}
+
+export function nopTransform(filename: string, source: string): string {
+  let ast = parseJavaScript(source, { loc: true });
+  const sourceMap = new SourceMapGenerator({
+    file: filename
+  });
+  sourceMap.setSourceContent(filename, source);
+  const converted = generateJavaScript(ast, { sourceMap });
+  return embedSourceMap(converted, sourceMap.toString());
 }

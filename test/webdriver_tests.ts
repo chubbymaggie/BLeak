@@ -1,18 +1,10 @@
 import createHTTPServer from './util/http_server';
 import {Server as HTTPServer} from 'http';
-//import ChromeBrowserDriver from '../src/webdriver/chrome_driver';
 import ChromeDriver from '../src/lib/chrome_driver';
-// import Proxy from '../src/proxy/proxy';
 import {equal as assertEqual} from 'assert';
+import NopLog from '../src/common/nop_log';
 
-//const PROXY_HTTP_PORT = 4445;
-//const PROXY_HTTPS_PORT = 4446;
-const HTTP_PORT = 8889;
-//const WEB_DRIVER_PORT = 4446;
-// Run HTTP server.
-// Load page that takes a long time to load -- blocking wait.
-// Make sure it finishes loading before it runs scripts.
-// Check magic values in page.
+const HTTP_PORT = 8890;
 
 describe("Chrome Driver", function() {
   // 30 second timeout.
@@ -26,7 +18,9 @@ describe("Chrome Driver", function() {
         data: Buffer.from("<!doctype html><html><div id='container'>ContainerText</div></html>", "utf8")
       }
     }, HTTP_PORT);
-    chromeDriver = await ChromeDriver.Launch(<any> process.stdout, true);
+    // Silence debug messages.
+    console.debug = () => {};
+    chromeDriver = await ChromeDriver.Launch(NopLog, true, 1920, 1080);
   });
 
   it("Successfully loads a webpage", async function() {
@@ -35,25 +29,23 @@ describe("Chrome Driver", function() {
     assertEqual(str, "ContainerText");
   });
 
-  /*it("Can take a heap snapshot", async function() {
-    const snapshot = await chromeDriver.takeHeapSnapshot();
-    assertEqual(typeof(snapshot), "object");
-    const expectedKeys = [ 'nodes',
-      'trace_function_infos',
-      'strings',
-      'edges',
-      'samples',
-      'snapshot',
-      'trace_tree' ].sort();
-    const keys = Object.keys(snapshot).sort();
-    console.log(`Sorted keys: ${keys.join(",")}`);
-    console.log(`Unsorted keys: ${Object.keys(snapshot).join(",")}`)
-    for (let i = 0; i < expectedKeys.length; i++) {
-      assertEqual(keys[i], expectedKeys[i]);
-    }
-  });*/
-
   after(async function() {
-    await Promise.all([chromeDriver.shutdown(), httpServer.close]);
+    return new Promise<void>((resolve, reject) => {
+      function closeChrome() {
+        if (chromeDriver) {
+          chromeDriver.shutdown().then(resolve, reject);
+        } else {
+          resolve();
+        }
+      }
+      function closeHttpServer() {
+        if (httpServer) {
+          httpServer.close(closeChrome);
+        } else {
+          closeChrome();
+        }
+      }
+      closeHttpServer();
+    });
   });
 });

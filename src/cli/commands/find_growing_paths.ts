@@ -1,34 +1,34 @@
-import {HeapGrowthTracker} from '../lib/growth_graph';
-import pathToString from '../lib/path_to_string';
+import {HeapGrowthTracker} from '../../lib/growth_graph';
+import pathToString from '../../lib/path_to_string';
 import {createReadStream} from 'fs';
 import * as readline from 'readline';
-import {SnapshotNodeTypeToString, SnapshotEdgeTypeToString, SnapshotNodeType} from '../common/interfaces';
-import {time} from '../common/util';
-import HeapSnapshotParser from '../lib/heap_snapshot_parser';
+import {SnapshotNodeTypeToString, SnapshotEdgeTypeToString, SnapshotNodeType} from '../../common/interfaces';
+import {time} from '../../common/util';
+import HeapSnapshotParser from '../../lib/heap_snapshot_parser';
 import {createGunzip} from 'zlib';
+import {CommandModule} from 'yargs';
+import ConsoleLog from '../../common/console_log';
 
 function getHeapSnapshotParser(file: string): HeapSnapshotParser {
   const parser = new HeapSnapshotParser();
-  const stream = createReadStream(file).pipe(createGunzip());
+  let stream: NodeJS.ReadableStream = createReadStream(file);
+  if (file.endsWith('.gz')) {
+    stream = stream.pipe(createGunzip());
+  }
   stream.on('data', function(d) {
     parser.addSnapshotChunk(d.toString());
   });
   return parser;
 }
 
-async function main() {
-  const files = process.argv.slice(2);
-  if (files.length === 0) {
-    console.log(`Usage: ${process.argv[0]} ${process.argv[1]} snap1.heapsnapshot.gz snap2.heapsnapshot.gz [more *.heapsnapshots.gz in order...]\n\nPrints out growing paths in the heap over several snapshots.`);
-    process.exit();
-  }
+async function main(files: string[]) {
   const t = new HeapGrowthTracker();
   for (const file of files) {
     console.log(`Processing ${file}...`);
-    await t.addSnapshot(getHeapSnapshotParser(file));
+    await t.addSnapshot(getHeapSnapshotParser(file), ConsoleLog);
   }
 
-  const growth = time('Get Growing Objects', console, () => t.findLeakPaths());
+  const growth = time('Get Growing Objects', ConsoleLog, () => t.findLeakPaths(ConsoleLog));
   console.log(`Found ${growth.length} growing paths.`);
   console.log(``);
   console.log(`Report`);
@@ -154,4 +154,27 @@ async function main() {
   runRound();
 }
 
-main();
+interface CommandLineOptions {
+  snapshots: string[];
+}
+
+const FindGrowingPaths: CommandModule = {
+  command: 'find-growing-paths [snapshots...]',
+  describe: 'Locates growing paths in a set of heap snapshots on disk. Useful for debugging BLeak.',
+  handler: (args: CommandLineOptions) => {
+    if (args.snapshots.length === 0) {
+      console.log(`No heap snapshots specified; nothing to do.`);
+      return;
+    }
+    main(args.snapshots);
+  },
+  builder: (argv) => {
+    return argv.positional('snapshots', {
+      describe: 'Paths to heap snapshots (Gzipped) on disk, and in-order',
+      type: 'string'
+    });
+  }
+};
+
+export default FindGrowingPaths;
+

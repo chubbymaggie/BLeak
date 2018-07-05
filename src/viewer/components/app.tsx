@@ -1,10 +1,13 @@
 import * as React from 'react';
 import BLeakResults from '../../lib/bleak_results';
-import HeapGrowthGraph from './heap_growth_graph';
+import {default as HeapGrowthGraph, isRankingEvaluationComplete} from './heap_growth_graph';
 import LeakRootsAndStackTraces from './leak_roots_and_stack_traces';
 import SourceCodeViewer from './source_code_view';
 import SourceFileManager from '../model/source_file_manager';
-import {FileLocation} from '../model/interfaces';
+import Location from '../model/location';
+import StackTraceManager from '../model/stack_trace_manager';
+import GrowthReductionTable from './growth_reduction_table';
+import GrowthReductionGraph from './growth_reduction_graph';
 
 const enum ViewState {
   WAIT_FOR_FILE,
@@ -15,11 +18,12 @@ const enum ViewState {
 interface AppState {
   state: ViewState;
   bleakResults: BLeakResults | null;
+  stackTraces: StackTraceManager | null;
   sourceFileManager: SourceFileManager | null;
   errorMessage: string | null;
   progress: number;
   progressMessage: string | null;
-  fileLocation: FileLocation;
+  selectedLocation: Location | null;
 }
 
 export default class App extends React.Component<{}, AppState> {
@@ -28,12 +32,77 @@ export default class App extends React.Component<{}, AppState> {
     this.state = {
       state: ViewState.WAIT_FOR_FILE,
       bleakResults: null,
+      stackTraces: null,
       sourceFileManager: null,
       errorMessage: null,
       progress: -1,
       progressMessage: null,
-      fileLocation: null
+      selectedLocation: null
     };
+  }
+
+  private async _tryDisplayFile(result: string, startingPercent: number): Promise<void> {
+    const bleakResults = BLeakResults.FromJSON(JSON.parse(result));
+    const sourceFileManager = await SourceFileManager.FromBLeakResults(bleakResults, (completed, total) => {
+      const percent = startingPercent + (completed / total) * (100 - startingPercent);
+      this.setState({
+        progress: percent,
+        progressMessage: `${completed} of ${total} source files formatted...`
+      });
+    });
+    const sourceFiles = sourceFileManager.getSourceFiles();
+    const stackTraces = StackTraceManager.FromBLeakResults(sourceFileManager, bleakResults);
+    this.setState({
+      state: ViewState.DISPLAYING_FILE,
+      bleakResults,
+      sourceFileManager,
+      stackTraces,
+      selectedLocation: new Location(sourceFiles[0], 1, 1, true)
+    });
+  }
+
+  private _loadFromUrl(url: string): void {
+    this.setState({
+      state: ViewState.PROCESSING_FILE,
+      progress: 10,
+      progressMessage: "Downloading results file ...",
+      errorMessage: null
+    });
+    // 40%
+    const xhr = new XMLHttpRequest();
+    xhr.open('GET', url);
+    xhr.onprogress = (e) => {
+      const p = e.loaded / e.total;
+      this.setState({ progress: 10 + (p * 40) });
+    };
+    xhr.onload = async (e) => {
+      try {
+        this.setState({ progress: 50 });
+        this._tryDisplayFile(xhr.responseText, 50);
+      } catch (e) {
+        this.setState({
+          state: ViewState.WAIT_FOR_FILE,
+          errorMessage: `${e}`
+        });
+      }
+    };
+    xhr.onerror = (e) => {
+      this.setState({
+        state: ViewState.WAIT_FOR_FILE,
+        errorMessage: `${e}`
+      });
+    };
+    xhr.send();
+  }
+
+  public componentDidMount() {
+    // Check for url parameter.
+    const hash = window.location.hash;
+    const urlIndex = hash.indexOf('url=');
+    if (urlIndex !== -1) {
+      const url = hash.slice(urlIndex + 4);
+      this._loadFromUrl(url);
+    }
   }
 
   private _onFileSelect() {
@@ -42,7 +111,7 @@ export default class App extends React.Component<{}, AppState> {
     if (files.length > 0) {
       this.setState({
         state: ViewState.PROCESSING_FILE,
-        progress: 0,
+        progress: 10,
         progressMessage: "Reading in file...",
         errorMessage: null
       });
@@ -50,24 +119,7 @@ export default class App extends React.Component<{}, AppState> {
       const reader = new FileReader();
       reader.onload = async (e) => {
         try {
-          const bleakResults = BLeakResults.FromJSON(JSON.parse((e.target as FileReader).result as string));
-          const sourceFileManager = await SourceFileManager.FromBLeakResults(bleakResults, (completed, total) => {
-            const percent = (completed / total) * 100;
-            this.setState({
-              progress: percent,
-              progressMessage: `${completed} of ${total} source files formatted...`
-            });
-          });
-          this.setState({
-            state: ViewState.DISPLAYING_FILE,
-            bleakResults,
-            sourceFileManager,
-            fileLocation: {
-              url: sourceFileManager.getSourceFiles()[0].url,
-              line: 1,
-              column: 1
-            }
-          });
+          this._tryDisplayFile((e.target as FileReader).result as string, 10);
         } catch (e) {
           this.setState({
             state: ViewState.WAIT_FOR_FILE,
@@ -92,9 +144,10 @@ export default class App extends React.Component<{}, AppState> {
   }
 
   public render() {
+    const rankEvalComplete = this.state.state === ViewState.DISPLAYING_FILE && isRankingEvaluationComplete(this.state.bleakResults);
     return <div>
       <nav className="navbar navbar-expand-md navbar-dark bg-dark fixed-top">
-        <a className="navbar-brand" href="/">BLeak Results Viewer</a>
+        <a className="navbar-brand" href="/"><img src="icon.svg" className="icon" /> BLeak Results Viewer</a>
       </nav>
 
       <main role="main" className="container-fluid">
@@ -104,43 +157,44 @@ export default class App extends React.Component<{}, AppState> {
             <p className="lead">Upload bleak_results.json from a BLeak run to view the results.</p>
             <hr className="my-4" />
             <form className={"needs-validation" + (this.state.errorMessage ? " was-validated" : "")}>
-              <div className="form-group">
-                <input ref="file_select" disabled={this.state.state === ViewState.PROCESSING_FILE} type="file" className={"form-control form-control-file" + (this.state.errorMessage ? " is-invalid" : "")} id="bleakResultsUpload" accept=".json" />
-                <div className="invalid-feedback">{this.state.errorMessage}</div>
-              </div>
+              {this.state.state === ViewState.PROCESSING_FILE ?
+                <div className="progress" key="bleakProgress">
+                  <div className="progress-bar" role="progressbar" style={{width: `${this.state.progress.toFixed(0)}%` }} aria-valuenow={this.state.progress} aria-valuemin={0} aria-valuemax={100}>{this.state.progressMessage}</div>
+                </div> :
+                <div key="bleakUploadForm" className="form-group">
+                  <input ref="file_select" type="file" className={"form-control form-control-file" + (this.state.errorMessage ? " is-invalid" : "")} id="bleakResultsUpload" accept=".json" />
+                  <div className="invalid-feedback">{this.state.errorMessage}</div>
+                </div>}
             </form>
             <p className="lead">
               <button type="submit" className="btn btn-primary" disabled={this.state.state === ViewState.PROCESSING_FILE} onClick={this._onFileSelect.bind(this)}>Submit</button>
             </p>
-            {this.state.state === ViewState.PROCESSING_FILE ?
-              <div className="progress" key="bleakProgress">
-                <div className="progress-bar" role="progressbar" style={{width: `${this.state.progress.toFixed(0)}%` }} aria-valuenow={this.state.progress} aria-valuemin={0} aria-valuemax={100}>{this.state.progressMessage}</div>
-              </div> : ''}
           </div>
         : ''}
         {this.state.state === ViewState.DISPLAYING_FILE ? <div key="bleakResults">
           <div className="row">
-            <div className="col-sm">
-              <h3>Heap Growth</h3>
+            <div className={rankEvalComplete ? "col-sm-7" : "col-sm"}>
+              <h3>Live Heap Size</h3>
               <HeapGrowthGraph key="heap_growth" bleakResults={this.state.bleakResults} />
             </div>
+            {rankEvalComplete ? <div key="rankingEvalTable" className="col-sm-5">
+              <h3>Growth Reduction for Top Leaks Fixed</h3>
+              <GrowthReductionGraph bleakResults={this.state.bleakResults} />
+              <GrowthReductionTable bleakResults={this.state.bleakResults} />
+            </div> : ''}
           </div>
           <div className="row">
             <div className="col-sm-5">
               <h3>Leak Roots and Stack Traces</h3>
               <LeakRootsAndStackTraces key="leak_root_list" onStackFrameSelect={(sf) => {
                 this.setState({
-                  fileLocation: {
-                    url: sf[0],
-                    line: sf[1],
-                    column: sf[2]
-                  }
+                  selectedLocation: sf
                 });
-              }} bleakResults={this.state.bleakResults} fileLocation={this.state.fileLocation} />
+              }} bleakResults={this.state.bleakResults} stackTraces={this.state.stackTraces} selectedLocation={this.state.selectedLocation} />
             </div>
             <div className="col-sm-7">
               <h3>Source Code</h3>
-              <SourceCodeViewer key="source_code_viewer" files={this.state.sourceFileManager} fileLocation={this.state.fileLocation} results={this.state.bleakResults} />
+              {this.state.sourceFileManager.getSourceFiles().length === 0 ? <p key="no_source_files">No source files found in results file.</p> :  <SourceCodeViewer key="source_code_viewer" files={this.state.sourceFileManager} stackTraces={this.state.stackTraces} location={this.state.selectedLocation} /> }
             </div>
           </div>
         </div> : ''}

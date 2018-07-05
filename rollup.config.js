@@ -3,17 +3,17 @@ import buble from 'rollup-plugin-buble';
 import resolve from 'rollup-plugin-node-resolve';
 import commonjs from 'rollup-plugin-commonjs';
 import replace from 'rollup-plugin-replace';
-// import builtins from 'rollup-plugin-node-builtins';
-// import globals from 'rollup-plugin-node-globals';
+import {uglify} from 'rollup-plugin-uglify';
 import {join} from 'path';
 
 const inBase = join(__dirname, 'build', 'browser', 'src');
 const outBase = join(__dirname, 'build', 'browser');
+const PRODUCTION = process.env['BUILD'] === 'production';
 
 export default {
   input: join(inBase, 'viewer', 'index.js'),
   output: [{
-    file: join(outBase, 'viewer.js'),
+    file: join(outBase, PRODUCTION ? 'viewer.min.js' : 'viewer.js'),
     sourcemap: true,
     strict: true,
     globals: {
@@ -26,6 +26,7 @@ export default {
   external: ['d3', 'jquery'],
   plugins: [
     sourcemaps(),
+    PRODUCTION && uglify(),
     buble({
       transforms: {
         // Assumes all `for of` statements are on arrays or array-like items.
@@ -33,27 +34,13 @@ export default {
       }
     }),
     resolve({
-      // use "module" field for ES6 module if possible
-      module: true, // Default: true
-
-      // use "jsnext:main" if possible
-      // – see https://github.com/rollup/rollup/wiki/jsnext:main
-      jsnext: true,  // Default: false
-
-      // use "main" field or index.js, even if it's not an ES6 module
-      // (needs to be converted from CommonJS to ES6
-      // – see https://github.com/rollup/rollup-plugin-commonjs
-      main: true,  // Default: true
-
-      // some package.json files have a `browser` field which
-      // specifies alternative files to load for people bundling
-      // for the browser. If that's you, use this option, otherwise
-      // pkg.browser will be ignored
-      browser: true  // Default: false
+      module: true,
+      jsnext: true,
+      main: true,
+      browser: true
     }),
     commonjs({
       namedExports: {
-        //'vis': ['Network', 'DataSet'],
         'react-dom': ['render'],
         'react': ['Component', 'createElement'],
         'brace': ['acequire']
@@ -61,9 +48,7 @@ export default {
     }),
     replace({
       // Production for production builds.
-      'process.env.NODE_ENV': JSON.stringify( 'development' )
+      'process.env.NODE_ENV': JSON.stringify( PRODUCTION ? 'production' : 'development' )
     })
-    // builtins(),
-    // globals()
-  ]
+  ].filter(Boolean)
 };

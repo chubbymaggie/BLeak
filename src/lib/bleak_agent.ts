@@ -30,12 +30,14 @@ interface Window {
   $$$EQ$$$(a: any, b: any): boolean;
   $$$SHOULDFIX$$$(n: number): boolean;
   $$$GLOBAL$$$: Window;
-  $$$REWRITE_EVAL$$$(scope: any, source: string): any;
+  $$$REWRITE_EVAL$$$(scope: any, strictMode: boolean, source: string): any;
+  $$$GLOBAL_EVAL$$$(source: string): any;
   $$$FUNCTION_EXPRESSION$$$(fcn: Function, scope: Scope): Function;
   $$$OBJECT_EXPRESSION$$$(obj: object, scope: Scope): object;
   $$$CREATE_WITH_SCOPE$$$(withObj: Object, scope: Scope): Scope;
   $$$SERIALIZE_DOM$$$(): void;
   $$$DOM$$$: MirrorNode;
+  $$$OBJECT$$$: typeof Object;
 }
 
 interface ListenerInfo {
@@ -87,13 +89,17 @@ declare function importScripts(s: string): void;
   ROOT.$$$SHOULDFIX$$$ = $$$SHOULDFIX$$$;
   ROOT.$$$GLOBAL$$$ = ROOT;
   ROOT.$$$REWRITE_EVAL$$$ = $$$REWRITE_EVAL$$$;
+  // Disable strict mode eval, as indirect evals in strict and non-strict mode can create global vars.
+  ROOT.$$$GLOBAL_EVAL$$$ = $$$REWRITE_EVAL$$$.bind(null, ROOT, false);
   ROOT.$$$FUNCTION_EXPRESSION$$$ = $$$FUNCTION_EXPRESSION$$$;
   ROOT.$$$OBJECT_EXPRESSION$$$ = $$$OBJECT_EXPRESSION$$$;
   ROOT.$$$CREATE_WITH_SCOPE$$$ = $$$CREATE_WITH_SCOPE$$$;
   ROOT.$$$SERIALIZE_DOM$$$ = $$$SERIALIZE_DOM$$$;
+  // Some programs define local variables named 'Object'.
+  ROOT.$$$OBJECT$$$ = Object;
 
   const r = /'/g;
-  // Some websites overwrite logToConsole.
+  // Some websites overwrite console.log, so grab a reference for debug logging.
   const console = ROOT.console ? ROOT.console : { log: (str: string) => {} };
   const consoleLog = console.log;
   function logToConsole(s: string) {
@@ -218,6 +224,27 @@ declare function importScripts(s: string): void;
     }
   }
 
+  /**
+   * Applies a write to the given scope. Used in `eval()` to avoid storing/transmitting
+   * metadata for particular scope objects.
+   *
+   * Searches the scope chain for the given `key`. If found, it overwrites the value on
+   * the relevant scope in the scope chain.
+   *
+   * If not found, defines a global variable `key`.
+   * @param target
+   * @param key
+   * @param value
+   */
+  function applyWriteNonStrict(target: Scope, key: string, value: any): boolean {
+    if (applyWrite(target, key, value)) {
+      return true;
+    } else {
+      (ROOT.$$$GLOBAL$$$ as any)[key] = value;
+      return true;
+    }
+  }
+
   // Sentinel
   const PROP_NOT_FOUND = {};
 
@@ -238,18 +265,20 @@ declare function importScripts(s: string): void;
   // Reuseable eval() function. Does not have a polluted scope.
   const EVAL_FCN = new Function('scope', '$$$SRC$$$', 'return eval($$$SRC$$$);');
   // Caches compiled eval statements from server to reduce synchronous XHRs.
-  const EVAL_CACHE = new Map<string, { e: string, ts: number }>();
-  const EVAL_CACHE_LIMIT = 100;
+  const NONSTRICT_EVAL_CACHE = new Map<string, { e: string, ts: number }>();
+  const NONSTRICT_EVAL_CACHE_LIMIT = 100;
+  const STRICT_EVAL_CACHE = new Map<string, { e: string, ts: number }>();
+  const STRICT_EVAL_CACHE_LIMIT = 100;
 
   /**
    * Removes the 10 items from EVAL_CACHE that were least recently used.
    */
-  function trimEvalCache() {
+  function trimEvalCache(evalCache: Map<string, { e: string, ts: number }>) {
     const items: {e: string, ts: number}[] = [];
-    EVAL_CACHE.forEach((i) => items.push(i));
+    evalCache.forEach((i) => items.push(i));
     items.sort((a, b) => a.ts - b.ts);
     items.slice(0, 10).forEach((i) => {
-      EVAL_CACHE.delete(i.e);
+      evalCache.delete(i.e);
     });
   }
 
@@ -257,19 +286,22 @@ declare function importScripts(s: string): void;
    * Sends text passed to `eval` to the server for rewriting,
    * and then evaluates the new string.
    * @param scope The context in which eval was called.
+   * @param strictMode If true, the eval was called in a strict mode context.
    * @param text The JavaScript code to eval.
    */
-  function $$$REWRITE_EVAL$$$(scope: any, source: string): any {
-    let cache = EVAL_CACHE.get(source);
+  function $$$REWRITE_EVAL$$$(scope: any, strictMode: boolean, source: string): any {
+    const evalCache = strictMode ? STRICT_EVAL_CACHE : NONSTRICT_EVAL_CACHE;
+    const evalCacheLimit = strictMode ? STRICT_EVAL_CACHE_LIMIT : NONSTRICT_EVAL_CACHE_LIMIT;
+    let cache = evalCache.get(source);
     if (!cache) {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/eval', false);
       xhr.setRequestHeader("Content-type", "application/json");
-      xhr.send(JSON.stringify({ scope: "scope", source }));
+      xhr.send(JSON.stringify({ scope: "scope", source, strictMode }));
       cache = { e: xhr.responseText, ts: 0 };
-      EVAL_CACHE.set(source, cache);
-      if (EVAL_CACHE.size > EVAL_CACHE_LIMIT) {
-        trimEvalCache();
+      evalCache.set(source, cache);
+      if (evalCache.size > evalCacheLimit) {
+        trimEvalCache(evalCache);
       }
     }
     // Update timestamp
@@ -277,7 +309,7 @@ declare function importScripts(s: string): void;
     return EVAL_FCN(new Proxy(scope, {
       // Appropriately relay writes to first scope with the given variable name.
       // Otherwise, it'll overwrite the property on the outermost scope!
-      set: applyWrite
+      set: strictMode ? applyWrite : applyWriteNonStrict
     }), cache.e);
   }
 
@@ -327,12 +359,15 @@ declare function importScripts(s: string): void;
    */
   function $$$OBJECT_EXPRESSION$$$(obj: object, scope: Scope): object {
     const props = Object.getOwnPropertyDescriptors(obj);
-    for (const prop of props) {
-      if (prop.get) {
-        $$$FUNCTION_EXPRESSION$$$(prop.get, scope);
-      }
-      if (prop.set) {
-        $$$FUNCTION_EXPRESSION$$$(prop.set, scope);
+    for (const propName in props) {
+      if (props.hasOwnProperty(propName)) {
+        const prop = props[propName];
+        if (prop.get) {
+          $$$FUNCTION_EXPRESSION$$$(prop.get, scope);
+        }
+        if (prop.set) {
+          $$$FUNCTION_EXPRESSION$$$(prop.set, scope);
+        }
       }
     }
     return obj;
@@ -538,7 +573,7 @@ declare function importScripts(s: string): void;
       //function LOG(s: string) {
         // logToConsole(`${accessStr}: ${s}`);
       //}
-      obj.$$$PROXY$$$ = new Proxy(obj, {
+      Object.defineProperty(obj, '$$$PROXY$$$', { value: new Proxy(obj, {
         defineProperty: function(target, property, descriptor): boolean {
           if (!disableProxies) {
             // Capture a stack trace.
@@ -549,8 +584,10 @@ declare function importScripts(s: string): void;
         },
         set: function(target, property, value, receiver): boolean {
           if (!disableProxies) {
-            // Capture a stack trace.
-            _addStackTrace(getProxyStackTraces(target), property);
+            if (!target.hasOwnProperty(property)) {
+              // Capture a stack trace.
+              _addStackTrace(getProxyStackTraces(target), property);
+            }
           }
           // LOG(`set`);
           return Reflect.set(target, property, value, target);
@@ -563,7 +600,7 @@ declare function importScripts(s: string): void;
           // LOG(`deleteProperty`);
           return Reflect.deleteProperty(target, property);
         }
-      });
+      }), enumerable: false, configurable: true, writable: true });
     }
     return obj.$$$PROXY$$$;
   }
@@ -664,18 +701,6 @@ declare function importScripts(s: string): void;
     }
   }
 
-  // Need:
-  // - DOM set proxies
-  //   -> Invalidate / refresh when changed
-  // - Fast checker of node.
-
-  // Operations can impact:
-  // - Current node
-  // - Parent node
-  // - Child nodes
-  // Update target node & all children.
-  //
-
   function instrumentDOMTree(rootAccessString: string, root: any, tree: IPathTree, stackTrace: string = null): void {
     // For now: Simply crawl to the node(s) and instrument regularly from there. Don't try to plant getters/setters.
     // $$DOM - - - - - -> root [regular subtree]
@@ -728,11 +753,13 @@ declare function importScripts(s: string): void;
 
     // Capture writes of children.
     const children = tree.children;
-    const instrumentFunction = switchToRegularTree ? instrumentTree : instrumentDOMTree;
-    const len = children.length;
-    for (let i = 0; i < len; i++) {
-      const child = children[i];
-      instrumentFunction(accessString, obj, child, stackTrace);
+    if (children) {
+      const instrumentFunction = switchToRegularTree ? instrumentTree : instrumentDOMTree;
+      const len = children.length;
+      for (let i = 0; i < len; i++) {
+        const child = children[i];
+        instrumentFunction(accessString, obj, child, stackTrace);
+      }
     }
   }
 
@@ -749,10 +776,12 @@ declare function importScripts(s: string): void;
 
     // Capture writes of children.
     const children = tree.children;
-    const len = children.length;
-    for (let i = 0; i < len; i++) {
-      const child = children[i];
-      instrumentTree(accessString, obj, child, stackTrace);
+    if (children) {
+      const len = children.length;
+      for (let i = 0; i < len; i++) {
+        const child = children[i];
+        instrumentTree(accessString, obj, child, stackTrace);
+      }
     }
   }
 
@@ -788,8 +817,10 @@ declare function importScripts(s: string): void;
       }
 
       const children = path.children;
-      for (const child of children) {
-        getStackTraces(obj, child, stacksMap);
+      if (children) {
+        for (const child of children) {
+          getStackTraces(obj, child, stacksMap);
+        }
       }
     }
   }
@@ -828,10 +859,12 @@ declare function importScripts(s: string): void;
     // Capture writes of children.
     const children = path.children;
     const getStackTracesFunction = switchToRegularTree ? getStackTraces : getDOMStackTraces;
-    const len = children.length;
-    for (let i = 0; i < len; i++) {
-      const child = children[i];
-      getStackTracesFunction(obj, child, stacksMap);
+    if (children) {
+      const len = children.length;
+      for (let i = 0; i < len; i++) {
+        const child = children[i];
+        getStackTracesFunction(obj, child, stacksMap);
+      }
     }
   }
 
@@ -861,8 +894,9 @@ declare function importScripts(s: string): void;
   }
 
   if (IS_WINDOW || IS_WORKER) {
-    // Disable these in NodeJS.
+    // Disable these in NodeJS -- where we run unit tests.
 
+    // TODO: BLeak currently does not properly diagnose leaks in code / DOM nodes planted via document.write.
     /*const documentWrite = Document.prototype.write;
     Document.prototype.write = function(this: Document, str: string): void {
       const xhr = new XMLHttpRequest();
@@ -1062,7 +1096,6 @@ declare function importScripts(s: string): void;
       };
     })(Array.prototype.splice);
 
-    // Make indexOf use $$$SEQ$$$
     Array.prototype.indexOf = function(this: Array<any>, searchElement, fromIndexArg?: number): any {
       let fromIndex = fromIndexArg || 0;
       // If the provided index value is a negative number, it is taken as the offset from the end of the array.
@@ -1118,7 +1151,7 @@ declare function importScripts(s: string): void;
 
     // TODO: Sort, reverse, ...
 
-    // Deterministic Math.random(), so jQuery variable is deterministic.
+    // Deterministic Math.random(), so jQuery variable name is deterministic across runs.
     // From https://gist.github.com/mathiasbynens/5670917
     Math.random = (function() {
       let seed = 0x2F6E2B1;
@@ -1134,54 +1167,11 @@ declare function importScripts(s: string): void;
       };
     }());
 
-    // Deterministic Date.now(), so YUI variable is deterministic.
+    // Deterministic Date.now(), so YUI variable name is deterministic across runs.
     let dateNowCount = 0;
     Date.now = Date.prototype.getTime = function() {
       return 1516992512425 + (dateNowCount++);
     };
-
-    // interface Count {get: number; set: number; invoked: number }
-
-    /**
-     * [DEBUG] Installs a counter on a particular object property.
-     * @param obj
-     * @param property
-     * @param key
-     * @param countMap
-     */
-    /*function countPropertyAccesses(obj: any, property: string, key: string, countMap: Map<string, Count>): void {
-      let count: Count = { get: 0, set: 0, invoked: 0};
-      const original = Object.getOwnPropertyDescriptor(obj, property);
-      try {
-        Object.defineProperty(obj, property, {
-          get: function() {
-            count.get++;
-            const value = original.get ? original.get.apply(this) : original.value;
-            if (typeof(value) === "function") {
-              return function(this: any) {
-                count.invoked++;
-                return value.apply(this, arguments);
-              };
-            } else {
-              return value;
-            }
-          },
-          set: function(v) {
-            count.set++;
-            if (original.set) {
-              return original.set.call(this, v);
-            } else if (original.writable) {
-              original.value = v;
-            }
-            // Otherwise: NOP.
-          },
-          configurable: true
-        });
-        countMap.set(key, count);
-      } catch (e) {
-        logToConsole(`Unable to instrument ${key}`);
-      }
-    }*/
 
     /**
      * Interposes on a particular API to return proxy objects for objects with proxies and unwrap arguments that are proxies.
@@ -1252,13 +1242,10 @@ declare function importScripts(s: string): void;
           });
         });
 
-      //const countMap = new Map<string, Count>();
       [[Node.prototype, "Node"], [Element.prototype, "Element"], [HTMLElement.prototype, "HTMLElement"],
       [Document.prototype, "Document"], [HTMLCanvasElement.prototype, "HTMLCanvasElement"],
       [NodeList.prototype, "NodeList"]]
         .forEach((v) => Object.keys(v[0]).forEach((k) => proxyInterposition(v[0], k, `${v[1]}.${k}`)));
-
-      // TODO: Remove instrumentation when element moved?
 
       const $$$REINSTRUMENT$$$ = function(this: Node | NodeList): void {
         if (this.$$$TREE$$$) {
@@ -1613,90 +1600,8 @@ declare function importScripts(s: string): void;
           remove.call(this);
         }
       };
-      // Element:
-      // **SPECIAL**: dataset - modifies properties on DOM object through object!!!!
-      // -> throw exception if used.
 
-      // SVGElement:
-      // dataset: Throw exception if used
+      // TODO: Support Element/SVGElement.dataset, which modifies properties on DOM object.
     }
-
-
-
-    /*(<any> root)['$$PRINTCOUNTS$$'] = function(): void {
-      logToConsole(`API,GetCount,InvokedCount,SetCount`);
-      countMap.forEach((v, k) => {
-        if (v.get + v.set + v.invoked > 0) {
-          logToConsole(`${k},${v.get},${v.invoked},${v.set}`);
-        }
-      });
-    };*/
-
-    // Goal:
-    // - Attach unique IDs to all HTML tags in the DOM corresponding to their location post-body-load.
-    // - On update: Update IDs.
-    // - Insertion to scope modifies all IDs in scope.
-
-    // Possibilities:
-    // - Node is only in DOM.
-    //   - Instrument DOM location.
-    // - Node is only in heap.
-    //   - Instrument node object.
-    // - Node is in both.
-    //   - Instrument both.
-
-    // Regardless:
-    // - Need to *unwrap* arguments
-    // - Need to *wrap* return values
-
-    // Node:
-    // nodeValue: Not important?
-    // textContent: Pass it a string. Replaces content.
-    // appendChild: Passed a Node. Modifies DOM.
-    // insertBefore: Takes Nodes. Modifies DOM.
-    // isEqualNode: Takes a Node.
-    // isSameNode: Takes a Node.
-    // normalize: Removes things from DOM.
-    // removeChild: Removes a child.
-    // replaceChild: Replaces a child.
-
-    // Element:
-    // innerHTML
-    // outerHTML
-    // insertAdjacentElement
-    // insertAdjacentHTML
-    // insertAdjacentText
-    // remove
-    // **SPECIAL**: dataset - modifies properties on DOM object through object!!!!
-    // -> throw exception if used.
-
-    // SVGElement:
-    // dataset: Throw exception if used
-
-    // On properties:
-    // - Document.prototype
-    // - Element.prototype
-    // - MediaQueryList.prototype
-    // - FileReader.prototype
-    // - HTMLBodyElement
-    // - HTMLElement
-    // - HTMLFrameSetElement
-    // - AudioTrackList? TextTrack? TextTrackCue? TextTrackList? VideoTrackList?
-    // - ApplicationCache
-    // - EventSource
-    // - SVGAnimationElement
-    // - SVGElement
-    // - Performance?
-    // - Worker?
-    // - XMLHttpRequest
-    // - XMLHttpRequestEventTarget
-    // - WebSocket
-    // - IDBDatabase
-    // - IDBOpenDBRequest
-    // - IDBRequest
-    // - IDBTransaction
-    // - window.[property] (Special)
-
-
   }
 })();

@@ -54,7 +54,7 @@ describe('Proxy', function() {
   let httpServer: HTTPServer;
   before(async function() {
     httpServer = await createHTTPServer(FILES, HTTP_PORT);
-    proxy = await MITMProxy.Create(undefined, true);
+    proxy = await MITMProxy.Create(undefined, [], true);
   });
 
   async function requestFile(path: string, expected: Buffer): Promise<void> {
@@ -112,12 +112,33 @@ describe('Proxy', function() {
 
   after(function(done) {
     // Shutdown both HTTP server and proxy.
-    httpServer.close((e: any) => {
-      if (e) {
-        done(e);
+    let e: any;
+    function wrappedDone() {
+      done(e);
+    }
+
+    function closeProxy() {
+      if (proxy) {
+        proxy.shutdown().then(wrappedDone, (localE) => {
+          e = localE;
+          wrappedDone();
+        });
       } else {
-        proxy.shutdown().then(done).catch(done);
+        wrappedDone();
       }
-    });
+    }
+
+    function closeHttpServer() {
+      if (httpServer) {
+        httpServer.close((localE: any) => {
+          e = localE;
+          closeProxy();
+        });
+      } else {
+        closeProxy();
+      }
+    }
+
+    closeHttpServer();
   });
 });

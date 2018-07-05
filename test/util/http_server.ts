@@ -18,6 +18,12 @@ function sendResponse(res: ServerResponse, testFile: TestFile): void {
   res.end();
 }
 
+function ignoreEconnReset(e: any): void {
+  if ((e as any).code !== "ECONNRESET") {
+    throw e;
+  }
+}
+
 /**
  * Creates a test HTTP server that serves up static in-memory "files".
  * @param files Map from server path to file data.
@@ -27,6 +33,10 @@ export default function createSimpleServer(files: {[path: string]: TestFile}, po
   return new Promise<HTTPServer>((res, rej) => {
     // Start test HTTP server + proxy.
     const httpServer = createHTTPServer(function(req, res) {
+      // Handle error events so ECONNRESETs do not cause program to
+      // crash.
+      res.on('error', ignoreEconnReset);
+      req.on('error', ignoreEconnReset);
       const url = req.url.toLowerCase();
       const testFile = files[url] || files['/'];
       if (testFile) {
@@ -42,6 +52,11 @@ export default function createSimpleServer(files: {[path: string]: TestFile}, po
       } else {
         res(httpServer);
       }
+    });
+    httpServer.on('error', ignoreEconnReset);
+    httpServer.on('clientError', ignoreEconnReset);
+    httpServer.on('connection', (socket) => {
+      socket.on('error', ignoreEconnReset);
     });
   });
 }

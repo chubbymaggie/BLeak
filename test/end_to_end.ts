@@ -5,7 +5,7 @@ import ChromeDriver from '../src/lib/chrome_driver';
 import {readFileSync} from 'fs';
 import {equal as assertEqual} from 'assert';
 import NopProgressBar from '../src/lib/nop_progress_bar';
-// import {createWriteStream} from 'fs';
+import NopLog from '../src/common/nop_log';
 
 const HTTP_PORT = 8875;
 const DEBUG = false;
@@ -273,7 +273,11 @@ describe('End-to-end Tests', function() {
   let driver: ChromeDriver;
   before(async function() {
     httpServer = await createHTTPServer(FILES, HTTP_PORT);
-    driver = await ChromeDriver.Launch(<any> process.stdout, true);
+    if (!DEBUG) {
+      // Silence debug messages.
+      console.debug = () => {};
+    }
+    driver = await ChromeDriver.Launch(NopLog, true, 1920, 1080);
   });
 
   function createStandardLeakTest(description: string, rootFilename: string, expected_line: number): void {
@@ -304,7 +308,9 @@ describe('End-to-end Tests', function() {
           }
         ];
         exports.timeout = 30000;
-      `, new NopProgressBar(), driver/*, (ss) => {
+        exports.iterations = 3;
+        exports.postCheckSleep = 100;
+      `, new NopProgressBar(), driver, (results) => {}/*, (ss) => {
         const stream = createWriteStream(`${rootFilename}${i}.heapsnapshot`);
         ss.onSnapshotChunk = function(chunk, end) {
           stream.write(chunk);
@@ -348,18 +354,33 @@ describe('End-to-end Tests', function() {
   after(function(done) {
     //setTimeout(function() {
     // Shutdown both HTTP server and proxy.
-    function finish() {
-      httpServer.close((e: any) => {
-        if (e) {
-          done(e);
-        } else {
-          driver.shutdown().then(() => {
-            done();
-          }).catch(done);
-        }
-      });
+    let e: any = null;
+    function wrappedDone() {
+      done(e);
     }
-    DEBUG ? setTimeout(finish, 99999999) : finish();
+
+    function shutdownProxy() {
+      if (driver) {
+        driver.shutdown().then(wrappedDone, (localE) => {
+          e = localE;
+          wrappedDone();
+        });
+      } else {
+        wrappedDone();
+      }
+    }
+
+    function shutdownHTTPServer() {
+      if (httpServer) {
+        httpServer.close((localE: any) => {
+          e = localE;
+          shutdownProxy();
+        });
+      } else {
+        shutdownProxy();
+      }
+    }
+    DEBUG ? setTimeout(shutdownHTTPServer, 99999999) : shutdownHTTPServer();
     //}, 99999999);
   });
 });

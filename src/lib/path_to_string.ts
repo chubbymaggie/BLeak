@@ -121,7 +121,7 @@ class PathStream {
     const ss = this._ss;
     this._ss = this._s = null;
     ss.push(s);
-    return ss.reverse().join(" ");
+    return ss.filter((s) => s !== "").reverse().join(" ");
   }
   public setPath(p: IPath) {
     this._p = p;
@@ -158,6 +158,10 @@ const PS = new PathStream();
 export default function pathToString(p: IPath): string {
   PS.setPath(p);
   const segment = PS.peek();
+  if (!segment) {
+    // Empty path -- window object is growing.
+    return "window";
+  }
   if (segment.type === PathSegmentType.DOM_TREE) {
     PS.print("document");
     PS.advance();

@@ -1,12 +1,12 @@
 import * as React from 'react';
 import FileList from './file_list/file_list';
 import SourceFileManager from '../model/source_file_manager';
-import {default as AceEditor, Marker as AceMarker, Annotation as AceAnnotation} from 'react-ace';
+import {default as AceEditor, Annotation as AceAnnotation} from 'react-ace';
 import StackTraceManager from '../model/stack_trace_manager';
-import BLeakResults from '../../lib/bleak_results';
-import {FileLocation} from '../model/interfaces';
-import {IStackFrame} from '../../common/interfaces';
+import SourceFile from '../model/source_file';
+import StackFrame from '../model/stack_frame';
 import pathToString from '../../lib/path_to_string';
+import Location from '../model/location';
 import {acequire} from 'brace';
 import 'brace/mode/javascript';
 import 'brace/theme/github';
@@ -14,32 +14,75 @@ import 'brace/ext/searchbox';
 const Range = acequire('ace/range').Range;
 
 interface SourceCodeViewProps {
-  results: BLeakResults;
   files: SourceFileManager;
-  fileLocation: FileLocation;
+  location: Location;
+  stackTraces: StackTraceManager;
 }
 
 interface SourceCodeViewState {
   // The currently open file in the editor.
-  openFile: string;
-  stackTraces: StackTraceManager;
-  // URL => (line,column)
-  fileState: {[url: string]: [number, number]};
+  openFile: SourceFile;
+  editorState: Map<SourceFile, EditorFileState>;
   // Active annotations
-  highlightedFrames: IStackFrame[];
+  highlightedFrames: StackFrame[];
 }
+
+class EditorFileState {
+  constructor(public location: Location, public prettyPrinted: boolean) {}
+}
+
+class CharStream {
+  private _source: AceAjax.Document = null;
+  private _lineText: string = null;
+  private _startLocation: Location = null;
+  private _line: number = -1;
+  private _column: number = -1;
+
+  public init(source: AceAjax.Document, location: Location): void {
+    this._source = source;
+    this._startLocation = location;
+    this._line = location.lineZeroIndexed;
+    this._column = location.columnZeroIndexed;
+    this._lineText = source.getLine(this._line);
+  }
+
+  public EOF(): boolean {
+    return this._line >= this._source.getLength();
+  }
+
+  public nextChar(): string {
+    this._column++;
+    if (this._column >= this._lineText.length) {
+      this._line++;
+      this._column = 0;
+      this._lineText = this._source.getLine(this._line);
+    }
+    return this._lineText[this._column];
+  }
+
+  public toRange(): AceAjax.Range {
+    return new Range(this._startLocation.lineZeroIndexed, this._startLocation.column, this._line, this._column + 1);
+  }
+}
+
+const CHAR_STREAM = new CharStream();
 
 export default class SourceCodeView extends React.Component<SourceCodeViewProps, SourceCodeViewState> {
   constructor(props: SourceCodeViewProps, context?: any) {
     super(props, context);
-    const stm = StackTraceManager.FromBLeakResults(props.results);
     this.state = {
-      openFile: this.props.fileLocation.url,
-      stackTraces: stm,
-      fileState: {},
-      highlightedFrames: stm.getFramesForFile(this.props.fileLocation.url)
+      openFile: this.props.location.file,
+      editorState: new Map<SourceFile, EditorFileState>(),
+      highlightedFrames: this.props.stackTraces.getFramesForFile(this.props.location.file)
     };
-    this.state.fileState[this.state.openFile] = [props.fileLocation.line, props.fileLocation.column];
+    // Initialize editorState for all files.
+    this.props.files.getSourceFiles().forEach((f) => {
+      const efs = new EditorFileState(new Location(f, 1, 1, true), false);
+      this.state.editorState.set(f, efs);
+      if (f === this.state.openFile) {
+        efs.location = this.props.location;
+      }
+    });
   }
 
   public componentDidMount() {
@@ -52,6 +95,9 @@ export default class SourceCodeView extends React.Component<SourceCodeViewProps,
       const col = pos.column;
     });*/
     // guttermousedown
+    const editor: AceAjax.Editor = (this.refs.aceEditor as any).editor;
+    editor.$blockScrolling = Infinity;
+    //
   }
 
   public componentDidUpdate() {
@@ -62,25 +108,24 @@ export default class SourceCodeView extends React.Component<SourceCodeViewProps,
     const editor: AceAjax.Editor = (this.refs.aceEditor as any).editor;
 
     // Scroll into view
-    let editorState = this.state.fileState[this.state.openFile];
-    if (!editorState) {
-      editorState = [1, 1];
-      this.state.fileState[this.state.openFile] = editorState;
-    }
-    (editor.renderer.scrollCursorIntoView as any)({ row: editorState[0] - 1, column: editorState[1] - 1 }, 0.5);
+    const editorState = this.state.editorState.get(this.state.openFile);
+    const prettyPrint = editorState.prettyPrinted;
+    const editorStateLocation = prettyPrint ? editorState.location.getFormattedLocation() : editorState.location.getOriginalLocation();
+    // Scroll into center of view. (Column is 1-indexed here, row is 0-indexed)
+    (editor.renderer.scrollCursorIntoView as any)(editorStateLocation.toAceEditorLocation(), 0.5);
 
     const session = editor.getSession();
     const frames = this.state.highlightedFrames;
 
     // Display annotations for file.
     const annotations = frames.map((f): AceAnnotation => {
-      const leaks = this.state.stackTraces.getLeaksForLocation(f[0], f[1], f[2]);
-      return {
-        row: f[1] - 1,
-        column: f[2] - 1,
+      const ogLocation = f.getOriginalLocation();
+      const location = prettyPrint ? f.getFormattedLocation() : f.getOriginalLocation();
+      const leaks = this.props.stackTraces.getLeaksForLocation(ogLocation);
+      return Object.assign({
         type: 'error',
         text: `Contributes to memory leaks:\n${leaks.map((l) => pathToString(l.paths[0])).join(",\n")}`
-      };
+      }, location.toAceEditorLocation());
     });
     session.setAnnotations(annotations);
 
@@ -93,20 +138,22 @@ export default class SourceCodeView extends React.Component<SourceCodeViewProps,
     }
 
     const doc = session.getDocument();
-    const file = this.props.files.getSourceFile(this.state.openFile);
-    const fileSource = file.source;
 
     // Display markers.
     frames.forEach((f) => {
-      const index = doc.positionToIndex({ row: f[1] - 1, column: f[2] - 1 }, 0);
+      const location = prettyPrint ? f.getFormattedLocation() : f.getOriginalLocation();
+      const displayed = f.equal(editorState.location);
       let parensDeep = 0;
       let inString = false;
       let stringChar: string = null;
       let nextEscaped = false;
-      let end = index;
+      let onlyWhitespace = true;
+      CHAR_STREAM.init(doc, location);
+
+      // Hacky heuristic to figure out what to highlight.
       outerLoop:
-      for (end; end < fileSource.length; end++) {
-        const c = fileSource[end];
+      while (!CHAR_STREAM.EOF()) {
+        const c = CHAR_STREAM.nextChar();
         if (inString) {
           if (nextEscaped) {
             nextEscaped = false;
@@ -137,54 +184,79 @@ export default class SourceCodeView extends React.Component<SourceCodeViewProps,
           switch (c) {
             case '"':
             case "'":
+              onlyWhitespace = false;
               inString = true;
               stringChar = c;
               break;
             case '(':
+              onlyWhitespace = false;
               parensDeep = 1;
               break;
             case ';':
             case ',':
             case ':':
+              onlyWhitespace = false;
+              // FALL-THRU!
+            case '\r':
             case '\n':
               // End of statement.
-              break outerLoop;
+              if (!onlyWhitespace) {
+                break outerLoop;
+              }
+              break;
           }
         }
       }
-      const endPos = doc.indexToPosition(end, 0);
-      session.addMarker(new Range(f[1] - 1, f[2] - 1, endPos.row, endPos.column), 'leak_line', 'someType', false);
+      session.addMarker(CHAR_STREAM.toRange(), displayed ? 'leak_line_selected' : 'leak_line', 'someType', false);
     });
   }
 
   public componentWillReceiveProps(props: SourceCodeViewProps) {
-    const sf = props.fileLocation;
-    this._changeOpenFile(sf.url, true, [sf.line, sf.column]);
+    const loc = props.location;
+    this._changeOpenFile(true, loc);
   }
 
-  private _changeOpenFile(url: string, fromProps: boolean, position: [number, number] = this.state.fileState[url] ? this.state.fileState[url] : [1, 1]): void {
-    if (!fromProps && url === this.state.openFile) {
+  private _changeOpenFile(fromProps: boolean, location: Location): void {
+    if (!fromProps && location.file === this.state.openFile) {
       return;
     }
     const editor: AceAjax.Editor = (this.refs.aceEditor as any).editor;
     const lastRow = editor.getLastVisibleRow();
     const firstRow = editor.getFirstVisibleRow();
     const middle = Math.floor((lastRow - firstRow) / 2) + firstRow + 1;
-    const newFileState: {[url: string]: [number, number]} = Object.assign({}, this.state.fileState);
-    newFileState[this.state.openFile] = [middle, 1];
-    newFileState[url] = position;
-    const frames = this.state.stackTraces.getFramesForFile(url);
-    this.setState({ openFile: url, fileState: newFileState, highlightedFrames: frames });
+    const oldFileState = this.state.editorState.get(this.state.openFile);
+    oldFileState.location = new Location(this.state.openFile, middle, 1, !oldFileState.prettyPrinted);
+    const newFileState = this.state.editorState.get(location.file);
+    newFileState.location = location;
+    const frames = this.props.stackTraces.getFramesForFile(location.file);
+    this.setState({ openFile: location.file, highlightedFrames: frames });
+  }
+
+  private _prettyPrintToggle() {
+    const fileState = this.state.editorState.get(this.state.openFile);
+    fileState.prettyPrinted = !fileState.prettyPrinted;
+    this.setState({ editorState: this.state.editorState });
   }
 
   public render() {
+    const sourceFile = this.state.openFile;
+    const openFileState = this.state.editorState.get(sourceFile);
+
     return <div className="row">
       <div className="col-lg-3">
         <FileList files={this.props.files} editorFile={this.state.openFile} onFileSelected={(f) => {
-          this._changeOpenFile(f.url, false);
+          this._changeOpenFile(false, this.state.editorState.get(f).location);
         }} />
       </div>
       <div className="col-lg-9">
+        <div className="row">
+          <div className="col-lg-9">
+            <p><b>{this.state.openFile.url} {openFileState.prettyPrinted ? '(Pretty Printed)' : ''}</b></p>
+          </div>
+          <div className="col-lg-3">
+            <button type="button" className="btn btn-secondary" onClick={this._prettyPrintToggle.bind(this)}>{openFileState.prettyPrinted ? 'View Original' : 'Pretty Print' }</button>
+          </div>
+        </div>
         <AceEditor
           ref="aceEditor"
           readOnly={true}
@@ -193,7 +265,7 @@ export default class SourceCodeView extends React.Component<SourceCodeViewProps,
           width="100%"
           highlightActiveLine={false}
           setOptions={ { highlightGutterLine: false, useWorker: false } }
-          value={this.props.files.getSourceFile(this.state.openFile).source} />
+          value={openFileState.prettyPrinted ? sourceFile.formattedSource : sourceFile.source} />
       </div>
     </div>;
   }
